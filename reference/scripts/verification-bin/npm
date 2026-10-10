@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "${CODEX_RUNNER_NODE:?CODEX_RUNNER_NODE is required}" "${0%/*}/npm.mjs" "$@"

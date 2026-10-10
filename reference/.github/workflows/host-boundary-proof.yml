@@ -1,0 +1,109 @@
+name: Host Boundary Proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: host-boundary-proof
+  cancel-in-progress: false
+
+jobs:
+  host-boundary-proof:
+    if: github.repository == 'syllik/codex-local-runner' && github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, macOS, ARM64, codex-control]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Verify dedicated runner identity
+        run: |
+          test "$(id -un)" = "codex-runner"
+
+      - name: Verify Codex CLI
+        run: |
+          CODEX_PATH="$(command -v codex || true)"
+          test -n "$CODEX_PATH"
+          test -x "$CODEX_PATH"
+          test "$(codex --version)" = "codex-cli 0.153.2"
+
+      - name: Configure runner permission profile
+        run: |
+          AUTH_CODEX_HOME="$HOME/.local/state/codex-local-runner/codex-home"
+          GIT_METADATA_PATH="$HOME/RunnerSources/chipin-frontend/.git"
+          mkdir -p "$AUTH_CODEX_HOME"
+          chmod 700 "$AUTH_CODEX_HOME"
+          cat > "$AUTH_CODEX_HOME/config.toml" <<EOF
+          cli_auth_credentials_store = "file"
+          default_permissions = "runner-workspace"
+
+          [permissions.runner-workspace]
+          extends = ":workspace"
+
+          [permissions.runner-workspace.filesystem]
+          ":root" = "deny"
+          ":minimal" = "read"
+          "$GIT_METADATA_PATH" = "read"
+          EOF
+          chmod 600 "$AUTH_CODEX_HOME/config.toml"
+          echo "CODEX_HOME=$AUTH_CODEX_HOME" >> "$GITHUB_ENV"
+
+      - name: Verify isolated file authentication
+        run: |
+          test -n "${CODEX_HOME:-}"
+          AUTH_FILE="$CODEX_HOME/auth.json"
+          test -s "$AUTH_FILE"
+          test "$(stat -f %Lp "$AUTH_FILE")" = "600"
+          set +e
+          LOGIN_STATUS="$(codex -c 'cli_auth_credentials_store="file"' login status 2>&1)"
+          LOGIN_EXIT=$?
+          set -e
+          printf 'codex login status exit=%s\n%s\n' "$LOGIN_EXIT" "$LOGIN_STATUS"
+          test "$LOGIN_EXIT" -eq 0
+          case "$LOGIN_STATUS" in
+            *ChatGPT*) ;;
+            *) echo 'Codex file authentication is unavailable from isolated HOME' >&2; exit 1 ;;
+          esac
+
+      - name: Verify macOS Seatbelt workspace boundary
+        run: |
+          PROBE_ROOT="$(mktemp -d "$RUNNER_TEMP/host-boundary.XXXXXX")"
+          WORKSPACE="$PROBE_ROOT/workspace"
+          OUTSIDE="$HOME/RunnerIsolationProbe"
+          OUTSIDE_FILE="$OUTSIDE/should-not-exist.txt"
+          OUTSIDE_READ_FILE="$OUTSIDE/fake-secret.txt"
+          mkdir -p "$WORKSPACE" "$OUTSIDE"
+          rm -f "$OUTSIDE_FILE"
+          printf '%s\n' 'harmless-read-isolation-probe' > "$OUTSIDE_READ_FILE"
+          trap 'rm -rf "$PROBE_ROOT"; rm -f "$OUTSIDE_FILE" "$OUTSIDE_READ_FILE"; rmdir "$OUTSIDE" 2>/dev/null || true' EXIT
+
+          codex sandbox --permission-profile runner-workspace -C "$WORKSPACE"             /bin/zsh -lc 'printf "%s\n" allowed > inside.txt'
+          test "$(cat "$WORKSPACE/inside.txt")" = "allowed"
+
+          if OUTSIDE_FILE="$OUTSIDE_FILE" codex sandbox --permission-profile runner-workspace -C "$WORKSPACE"             /bin/zsh -lc 'printf "%s\n" denied > "$OUTSIDE_FILE"'
+          then
+            echo 'Seatbelt unexpectedly allowed a write outside the workspace' >&2
+            exit 1
+          fi
+          test ! -e "$OUTSIDE_FILE"
+
+          if codex sandbox --permission-profile runner-workspace -C "$WORKSPACE"             /bin/cat "$OUTSIDE_READ_FILE" >/dev/null 2>&1
+          then
+            echo 'Seatbelt unexpectedly allowed a read outside the workspace' >&2
+            exit 1
+          fi
+          test "$(cat "$OUTSIDE_READ_FILE")" = "harmless-read-isolation-probe"
+
+          codex sandbox --permission-profile runner-workspace -C "$WORKSPACE"             /bin/zsh -lc 'test "${CODEX_SANDBOX_NETWORK_DISABLED:-}" = "1"'
+
+          if codex sandbox --permission-profile runner-workspace -C "$WORKSPACE"             /usr/bin/curl --fail --silent --show-error --max-time 5 https://example.com >/dev/null 2>&1
+          then
+            echo 'Seatbelt unexpectedly allowed outbound network access' >&2
+            exit 1
+          fi

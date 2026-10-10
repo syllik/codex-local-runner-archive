@@ -1,0 +1,132 @@
+name: Execution Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to execute exactly once
+        required: true
+        type: number
+      approval_ref:
+        description: Explicit human approval provenance
+        required: true
+        type: string
+      expected_base_sha:
+        description: Exact target integration SHA
+        required: true
+        type: string
+      assembled_context:
+        description: Exact complete prepared textual execution context
+        required: true
+        type: string
+      assembled_context_actual_bytes:
+        description: Declared final assembled-context UTF-8 byte count
+        required: true
+        type: number
+      assembled_context_sha256:
+        description: Pre-approved SHA-256 of the exact complete prepared execution context
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: execution-proof-paid
+  cancel-in-progress: false
+
+jobs:
+  execution-proof:
+    if: github.repository == 'syllik/codex-local-runner' && github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, macOS, ARM64, codex-control]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout trusted commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Configure runner-owned paths
+        run: |
+          echo "CODEX_RUNNER_CHECKOUT_PATH=$HOME/RunnerSources/chipin-frontend" >> "$GITHUB_ENV"
+          echo "CODEX_RUNNER_WORKTREE_ROOT=$HOME/AgentWork/chipin-frontend" >> "$GITHUB_ENV"
+          NODE_BIN_PATH="$(dirname "$(command -v node)")"
+          echo "CODEX_RUNNER_NODE_BIN_PATH=$NODE_BIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Verify dedicated runner identity
+        run: |
+          test "$(id -un)" = "codex-runner"
+
+      - name: Verify Codex CLI
+        run: |
+          CODEX_PATH="$(command -v codex || true)"
+          test -n "$CODEX_PATH"
+          test -x "$CODEX_PATH"
+          test "$(codex --version)" = "codex-cli 0.153.2"
+
+      - name: Verify persistent file ChatGPT authentication
+        run: |
+          CODEX_HOME="$HOME/.local/state/codex-local-runner/codex-home"
+          export CODEX_HOME
+          test -n "${CODEX_HOME:-}"
+          AUTH_FILE="$CODEX_HOME/auth.json"
+          test -s "$AUTH_FILE"
+          test "$(stat -f %Lp "$AUTH_FILE")" = "600"
+          set +e
+          LOGIN_STATUS="$(codex -c 'cli_auth_credentials_store="file"' login status 2>&1)"
+          LOGIN_EXIT=$?
+          set -e
+          printf 'codex login status exit=%s\n%s\n' "$LOGIN_EXIT" "$LOGIN_STATUS"
+          test "$LOGIN_EXIT" -eq 0
+          case "$LOGIN_STATUS" in
+            *ChatGPT*) ;;
+            *) echo 'Codex file authentication is unavailable from persistent CODEX_HOME' >&2; exit 1 ;;
+          esac
+
+      - name: Verify GitHub CLI
+        run: command -v gh >/dev/null
+
+      - name: Verify target checkout
+        run: |
+          TARGET_CHECKOUT="$HOME/RunnerSources/chipin-frontend"
+          test -d "$TARGET_CHECKOUT"
+          test "$(git -C "$TARGET_CHECKOUT" rev-parse --is-inside-work-tree)" = "true"
+          # Require origin exactly ChipIn-one/chipin-frontend.
+          test "$(git -C "$TARGET_CHECKOUT" remote get-url origin)" = "https://github.com/ChipIn-one/chipin-frontend.git"
+
+      - name: Create ChipIn App installation token
+        id: chipin-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # v3.2.0 contract: client-id is intentional; app-id is deprecated.
+          client-id: ${{ vars.CHIPIN_RUNNER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CHIPIN_RUNNER_APP_PRIVATE_KEY }}
+          owner: ChipIn-one
+          repositories: chipin-frontend
+          permission-issues: write
+          permission-pull-requests: read
+          permission-organization-projects: read
+
+      - name: Execute one Issue
+        timeout-minutes: 57
+        env:
+          GH_TOKEN: ${{ steps.chipin-app-token.outputs.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          APPROVAL_REF: ${{ inputs.approval_ref }}
+          EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+          CODEX_RUNNER_ASSEMBLED_CONTEXT: ${{ inputs.assembled_context }}
+          ASSEMBLED_CONTEXT_ACTUAL_BYTES: ${{ inputs.assembled_context_actual_bytes }}
+          ASSEMBLED_CONTEXT_SHA256: ${{ inputs.assembled_context_sha256 }}
+          POLICY_SHA: da84127225083bfcbba45bc78b903517cf1e1153
+        run: |
+          export CODEX_RUNNER_EXECUTION_AUTHORIZATION="$(node -e 'process.stdout.write(JSON.stringify({taskIdentity: `ChipIn-one/chipin-frontend#${process.env.ISSUE_NUMBER}`, targetRepository: "ChipIn-one/chipin-frontend", expectedBaseSha: process.env.EXPECTED_BASE_SHA, policySha: process.env.POLICY_SHA, approvalRef: process.env.APPROVAL_REF, assembledContextBudgetBytes: 32768, assembledContextActualBytes: Number(process.env.ASSEMBLED_CONTEXT_ACTUAL_BYTES), assembledContextCheck: "PASSED", assembledContextSha256: process.env.ASSEMBLED_CONTEXT_SHA256}))')"
+          npm run runner -- execute "ChipIn-one/chipin-frontend#$ISSUE_NUMBER"

@@ -1,0 +1,117 @@
+name: Publication Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to publish exactly once
+        required: true
+        type: number
+      approval_ref:
+        description: New explicit publication approval provenance
+        required: true
+        type: string
+      execution_run_id:
+        description: Successful Step 10A execution run ID
+        required: true
+        type: string
+      expected_base_sha:
+        description: Frozen integration base SHA
+        required: true
+        type: string
+      verified_diff_fingerprint:
+        description: Verified Step 10A diff fingerprint
+        required: true
+        type: string
+      execution_policy_sha:
+        description: Step 10A execution policy SHA
+        required: true
+        type: string
+      approved_context_sha256:
+        description: Approved Step 10A context SHA-256
+        required: true
+        type: string
+      publisher_policy_sha:
+        description: Trusted Publisher workflow policy SHA
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publication-proof-paid
+  cancel-in-progress: false
+
+jobs:
+  publication-proof:
+    if: github.repository == 'syllik/codex-local-runner' && github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, macOS, ARM64, codex-control]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout trusted commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify dedicated runner identity
+        run: test "$(id -un)" = "codex-runner"
+
+      - name: Validate publication inputs
+        env:
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+          VERIFIED_DIFF_FINGERPRINT: ${{ inputs.verified_diff_fingerprint }}
+          EXECUTION_POLICY_SHA: ${{ inputs.execution_policy_sha }}
+          APPROVED_CONTEXT_SHA256: ${{ inputs.approved_context_sha256 }}
+          PUBLISHER_POLICY_SHA: ${{ inputs.publisher_policy_sha }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          case "$ISSUE_NUMBER" in ''|*[!0-9]*) echo 'invalid issue number' >&2; exit 1;; esac
+          test "$ISSUE_NUMBER" -gt 0
+          for value in "$EXPECTED_BASE_SHA" "$EXECUTION_POLICY_SHA" "$PUBLISHER_POLICY_SHA"; do
+            printf '%s' "$value" | grep -Eq '^[0-9a-fA-F]{40}$'
+          done
+          for value in "$VERIFIED_DIFF_FINGERPRINT" "$APPROVED_CONTEXT_SHA256"; do
+            printf '%s' "$value" | grep -Eq '^[0-9a-fA-F]{64}$'
+          done
+          # publisher_policy_sha == github.sha
+          test "$PUBLISHER_POLICY_SHA" = "$GITHUB_SHA"
+
+      - name: Create Publisher App installation token
+        id: chipin-publisher-app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CHIPIN_PUBLISHER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CHIPIN_PUBLISHER_APP_PRIVATE_KEY }}
+          owner: ChipIn-one
+          repositories: chipin-frontend
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+          permission-organization-projects: read
+
+      - name: Publish one Issue
+        env:
+          CODEX_RUNNER_PUBLISHER_TOKEN: ${{ steps.chipin-publisher-app-token.outputs.token }}
+          CODEX_RUNNER_PUBLISHER_POLICY_SHA: ${{ inputs.publisher_policy_sha }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+          APPROVAL_REF: ${{ inputs.approval_ref }}
+          EXECUTION_RUN_ID: ${{ inputs.execution_run_id }}
+          EXPECTED_BASE_SHA: ${{ inputs.expected_base_sha }}
+          VERIFIED_DIFF_FINGERPRINT: ${{ inputs.verified_diff_fingerprint }}
+          EXECUTION_POLICY_SHA: ${{ inputs.execution_policy_sha }}
+          APPROVED_CONTEXT_SHA256: ${{ inputs.approved_context_sha256 }}
+          PUBLISHER_POLICY_SHA: ${{ inputs.publisher_policy_sha }}
+        run: |
+          export CODEX_RUNNER_PUBLICATION_AUTHORIZATION="$(node -e 'process.stdout.write(JSON.stringify({taskIdentity: `ChipIn-one/chipin-frontend#${process.env.ISSUE_NUMBER}`, executionRunId: process.env.EXECUTION_RUN_ID, baseSha: process.env.EXPECTED_BASE_SHA, verifiedDiffFingerprint: process.env.VERIFIED_DIFF_FINGERPRINT, executionPolicySha: process.env.EXECUTION_POLICY_SHA, approvedContextSha256: process.env.APPROVED_CONTEXT_SHA256, publisherPolicySha: process.env.PUBLISHER_POLICY_SHA, approvalRef: process.env.APPROVAL_REF}))')"
+          npm run runner -- publish "ChipIn-one/chipin-frontend#$ISSUE_NUMBER"

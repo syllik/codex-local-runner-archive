@@ -1,0 +1,46 @@
+name: Control Spike
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to inspect exactly once
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: control-spike-issue-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  control-spike:
+    if: github.repository == 'syllik/codex-local-runner' && github.ref == 'refs/heads/master'
+    runs-on: [self-hosted, macOS, ARM64, codex-control]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout trusted commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.21.0
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Verify GitHub CLI
+        run: gh --version
+
+      - name: Read one Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json number,url,title,state,labels
